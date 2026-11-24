@@ -68,13 +68,19 @@ monitorizacion/
 
 ## Configuración
 
-Edita `config.sh` con las URLs reales de los canales:
+`config.sh` centraliza las direcciones. Define el webhook mediante variables
+de entorno para no guardar su token en el repositorio. Por defecto, las alertas
+usan el mismo webhook; el panel hace GET al endpoint de sincronización:
 
 ```bash
-URL_MONITOR="https://CAMBIAR/monitor"
-URL_ALERTAS="https://CAMBIAR/alertas"
+export URL_MONITOR="CAMBIAR_URL_MONITOR"
+export URL_ALERTAS="${URL_MONITOR}"
+export URL_CANAL="CAMBIAR_URL_GET_SYNC"
 INTERVALO_DEF=10
 ```
+
+El agente y el panel cargan estas variables al arrancar; las variables de
+entorno pueden reemplazar cualquier URL sin editar `config.sh`.
 
 Umbrales (`umbrales.json`). Si el fichero no existe se usan 60 y 85:
 
@@ -95,13 +101,22 @@ chmod +x agente.sh panel.sh pruebas/*.sh
 ```bash
 ./agente.sh            # envía cada 10 s
 ./agente.sh -i 5       # envía cada 5 s (recomendado para la demo)
+./agente.sh -o -i 5    # envía un único informe y termina
 ```
 
-**Panel** (en el equipo que muestra el resultado):
+**Panel** (en otra terminal, en el equipo que muestra el resultado):
 
 ```bash
-./panel.sh
+./panel.sh        # actualiza la tabla cada 5 s
+./panel.sh -o     # dibuja una tabla y termina
 ```
+
+El agente envía un informe JSON con las métricas en la raíz del objeto. La
+respuesta del canal puede ser un array o un objeto con `messages`; el panel
+acepta informes directos y mensajes con el informe dentro de `datos`. Selecciona
+el último informe de cada host, dibuja CPU, memoria, disco raíz, carga, gráfica
+e informa CAÍDO tras 30 s.
+Las alertas se publican únicamente al cambiar el estado.
 
 Para salir de cualquiera de los dos: `Ctrl+C`.
 
@@ -139,15 +154,21 @@ Alerta publicada en el canal `alertas`:
 | Uptime | `/proc/uptime` | Primer valor, en segundos |
 | Procesos | `ps -eo pid,comm,%cpu --sort=-%cpu` | Top 3, convertido a JSON solo con `jq` |
 
-El panel consulta el canal cada 5 s, se queda con el último informe de cada host (`group_by(.datos.host) | map(last)`) y repinta la tabla con `tput cup 0 0` para evitar parpadeos.
+El panel consulta el canal cada 5 s, se queda con el último informe de cada host
+(`group_by(.datos.host) | map(last)`) y repinta la tabla con `tput cup 0 0` para
+evitar parpadeos.
 
 ## Pruebas y demo
 
 ```bash
 ./pruebas/validar_contrato.sh   # valida el JSON del agente
 ./pruebas/probar_p5.sh          # colores, gráfica y alertas
+./pruebas/probar_integracion.sh # panel con canal simulado, sin red
 ./pruebas/estres.sh             # genera carga de CPU
 ```
+
+`validar_contrato.sh` sustituye `curl` por una función local y no necesita
+conectarse al webhook.
 
 Criterios de aceptación ("hecho cuando…"):
 
@@ -179,5 +200,3 @@ logs/
 estado/
 web/index.html
 ```
-
-

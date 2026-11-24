@@ -4,6 +4,16 @@ grafica() {
     local -a barras=( '▁' '▂' '▃' '▄' '▅' '▆' '▇' '█' )
 
     for valor in "$@"; do
+        # Los valores no numéricos se ignoran sin imprimir texto adicional.
+        if ! awk -v valor="$valor" '
+            BEGIN {
+                patron = "^[+-]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?$"
+                exit !(valor ~ patron)
+            }
+        '; then
+            continue
+        fi
+
         indice=$(awk -v valor="$valor" '
             BEGIN {
                 n = int(valor / 12.5)
@@ -16,16 +26,52 @@ grafica() {
     done
 }
 
-# El canal puede ser una ruta a un JSON o el contenido JSON directamente.
-# Se asume que el canal es un array de mensajes con el informe en .datos.
+# Lee el canal, que puede ser un array o un objeto con una propiedad messages.
+# Acepta informes directos y mensajes que guardan el informe dentro de .datos.
 ultimos_cpu() {
     local host="${1:-}"
     local json_canal="${2:-}"
-    local filtro='[.[] | select(.datos.host == $host) | .datos.cpu_pct | select(type == "number")][-20:][]'
+    local valor
 
-    if [[ -f "$json_canal" ]]; then
-        jq -r --arg host "$host" "$filtro" "$json_canal"
-    else
-        jq -r --arg host "$host" "$filtro" <<< "$json_canal"
+    [[ -n "$host" && -n "$json_canal" ]] || return 0
+
+    jq -r --arg host "$host" '
+        def mensajes:
+            if type == "array" then .
+            elif type == "object" and (.messages | type) == "array" then .messages
+            else []
+            end;
+
+        mensajes
+        | map(if (.datos | type) == "object" then .datos else . end)
+        | map(select(.host? == $host
+                     and (.cpu_pct? | type) == "number"
+                     and (.mem.pct? | type) == "number"
+                     and (.disco? | type) == "array"
+                     and (.carga? | type) == "array"
+                     and (.ts? | type) == "string"))
+        | sort_by(.ts)
+        | .[-20:]
+        | .[].cpu_pct
+    ' <<< "$json_canal" 2>/dev/null |
+        while IFS= read -r valor; do
+            printf '%s\n' "${valor%$'\r'}"
+        done || true
+}
+
+# Devuelve una gráfica de ancho fijo para la columna del panel.
+grafica_host() {
+    local host="${1:-}"
+    local json_canal="${2:-}"
+    local salida relleno
+    local -a valores=()
+
+    salida=$(ultimos_cpu "$host" "$json_canal")
+    if [[ -n "$salida" ]]; then
+        mapfile -t valores <<< "$salida"
     fi
+
+    relleno=$((20 - ${#valores[@]}))
+    (( relleno > 0 )) && printf '%*s' "$relleno" ''
+    grafica "${valores[@]}"
 }
