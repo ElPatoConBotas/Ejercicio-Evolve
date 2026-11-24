@@ -133,13 +133,28 @@ recoger_recursos() {
       uptime_seg: $up}'
 }
 
-# PUESTO 3: datos del sistema. Versión provisional (disco y carga).
-# Sustituir por la función definitiva del compañero.
-recoger_sistema() {
-  jq -n \
-    --argjson disco "$(df / | awk 'NR==2 {gsub("%","",$5); print $5}')" \
-    --arg carga "$(cut -d' ' -f1 /proc/loadavg 2>/dev/null || echo 0)" \
-    '{disco_pct: $disco, carga_1m: ($carga | tonumber)}'
+# PUESTO 3: disco y top 3 procesos (funciones definitivas)
+
+# df -P -> [{montaje, pct}] solo con jq: quita el %, admite puntos de montaje
+# con espacios y descarta pseudo-sistemas que solo meten ruido en el panel.
+recoger_disco() {
+  df -P -x tmpfs -x devtmpfs -x squashfs -x overlay -x efivarfs 2>/dev/null | jq -R -s -c '
+    split("\n")[1:]
+    | map(select(length > 0)
+          | capture("^\\S+\\s+\\d+\\s+\\d+\\s+\\d+\\s+(?<pct>\\d+)%\\s+(?<montaje>.+)$")
+          | {montaje, pct: (.pct | tonumber)})'
+}
+
+# ps -> [{pid, cmd, cpu}] con los 3 que más CPU gastan, solo con jq (sin bucles
+# de Bash). comm puede llevar espacios ("Isolated Web Co"): pid al principio,
+# %cpu al final y todo lo de en medio es cmd. El recorte a 3 lo hace jq.
+recoger_top_procesos() {
+  ps -eo pid,comm,%cpu --sort=-%cpu --no-headers | jq -R -s -c '
+    split("\n")
+    | map(select(length > 0)
+          | capture("^\\s*(?<pid>\\d+)\\s+(?<cmd>.+?)\\s+(?<cpu>[0-9]+(\\.[0-9]+)?)\\s*$")
+          | {pid: (.pid | tonumber), cmd, cpu: (.cpu | tonumber)})
+    | .[:3]'
 }
 
 # ---------------------------------------------------------------------------
@@ -158,18 +173,20 @@ json_o_reserva() {
 }
 
 montar_json() {
-  local host ts recursos sistema
+  local host ts recursos disco top
   host="$(hostname)"
   ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   recursos="$(json_o_reserva recursos "$(recoger_recursos 2>>"$LOG")" '{}')"
-  sistema="$(json_o_reserva sistema "$(recoger_sistema 2>>"$LOG")" '{}')"
+  disco="$(json_o_reserva disco "$(recoger_disco 2>>"$LOG")" '[]')"
+  top="$(json_o_reserva top_procesos "$(recoger_top_procesos 2>>"$LOG")" '[]')"
 
   jq -n \
     --arg host "$host" \
     --arg ts "$ts" \
     --argjson recursos "$recursos" \
-    --argjson sistema "$sistema" \
-    '{host: $host, ts: $ts, recursos: $recursos, sistema: $sistema}'
+    --argjson disco "$disco" \
+    --argjson top "$top" \
+    '{host: $host, ts: $ts, recursos: $recursos, disco: $disco, top_procesos: $top}'
 }
 
 enviar() {
