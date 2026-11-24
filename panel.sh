@@ -14,15 +14,16 @@ while true; do
     json_raw=$(curl -s "$URL_CANAL")
     ahora=$(date +%s)
 
-    # Extraer último informe por host (filtrando mensajes sin host como los de prueba)
+    # 1. Extraer último informe por host incluyendo ._origen
     mapfile -t filas < <(echo "$json_raw" | jq -r '
         [ .messages[] | select(.host != null) ]
         | sort_by(.ts)
-        | group_by(.host)
+        | group_by(._origen)
         | map(last)
         | .[]
         | [
-            .host,
+            (._origen // "N/A"),
+	    .host,
             (if .procesos then (([.procesos[].cpu] | add * 10 | round / 10 | tostring) + "%") else "N/A" end),
             (if .procesos then (([.procesos[].mem] | add * 10 | round / 10 | tostring) + "%") else "N/A" end),
             (if .sistema.disco_pct then ((.sistema.disco_pct | tostring) + "%") else "N/A" end),
@@ -33,15 +34,15 @@ while true; do
 
     tput cup 0 0
 
-    # Cabecera
-    printf "%-15s %-10s %-10s %-10s %-10s %-12s %-10s\n" \
-        "HOST" "CPU" "MEMORIA" "DISCO /" "CARGA" "ÚLTIMO INF." "ESTADO"
-    printf "%-15s %-10s %-10s %-10s %-10s %-12s %-10s\n" \
-        "---------------" "----------" "----------" "----------" "----------" "------------" "----------"
+    # 2. Cabecera con la nueva columna IP ORIGEN (ancho %-16s)
+    printf "%-16s %-15s %-10s %-10s %-10s %-10s %-12s %-10s\n" \
+         "IP ORIGEN" "HOST" "CPU" "MEMORIA" "DISCO /" "CARGA" "ÚLTIMO INF." " ESTADO"
+    printf "%-16s %-15s %-10s %-10s %-10s %-10s %-12s %-10s\n" \
+        "----------------" "---------------" "----------" "----------" "----------" "----------" "------------" "----------"
 
-    # Filas
+    # 3. Filas leyendo también ip_origen
     for fila in "${filas[@]}"; do
-        IFS=$'\t' read -r host cpu mem disco carga ts <<< "$fila"
+        IFS=$'\t' read -r ip_origen host cpu mem disco carga ts <<< "$fila"
 
         diferencia=$((ahora - ts))
         hora_formateada=$(date -d "@$ts" +"%H:%M:%S" 2>/dev/null || echo "Error")
@@ -52,12 +53,11 @@ while true; do
             estado="\e[32mOK\e[0m"
         fi
 
-        printf "%-15s %-10s %-10s %-10s %-10s %-12s " \
-            "$host" "$cpu" "$mem" "$disco" "$carga" "$hora_formateada"
+        printf "%-16s %-15s %-10s %-10s %-10s %-10s %-12s " \
+            "$ip_origen" "$host" "$cpu" "$mem" "$disco" "$carga" "$hora_formateada"
         echo -e "${estado}$(tput el)"
     done
 
     tput ed
     sleep "$INTERVALO"
 done
-
