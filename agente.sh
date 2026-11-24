@@ -52,15 +52,85 @@ command -v curl >/dev/null 2>&1 || { echo "Falta curl" >&2; exit 1; }
 # Piezas de datos (cada función imprime JSON válido por stdout)
 # ---------------------------------------------------------------------------
 
-# PUESTO 2: procesos. Versión provisional: ps -> array JSON solo con jq.
-# Sustituir por la función definitiva del compañero.
-recoger_procesos() {
-  ps -eo pid=,user=,pcpu=,pmem=,comm= | jq -R -n '
-    [inputs
-     | capture("^\\s*(?<pid>\\d+)\\s+(?<user>\\S+)\\s+(?<cpu>[\\d.]+)\\s+(?<mem>[\\d.]+)\\s+(?<comando>.+)$")
-     | .pid |= tonumber
-     | .cpu |= tonumber
-     | .mem |= tonumber]'
+# PUESTO 2: recursos (CPU, memoria, carga y uptime).
+# Las cuatro funciones auxiliares imprimen solo números (no JSON), listos para jq --argjson.
+# Si una lectura falla: no imprimen nada, avisan por stderr (acaba en agente.log) y devuelven 1.
+
+# Lee los contadores de CPU de /proc/stat. Imprime: "total inactivo"
+leer_cpu() {
+  local u n s id w irq sirq st
+  read -r _ u n s id w irq sirq st _ < /proc/stat || return 1
+  echo "$(( u + n + s + id + w + irq + sirq + st )) $(( id + w ))"
+}
+
+# % de uso de CPU: dos lecturas separadas 1 s. Ejemplo de salida: 12.5
+# porcentaje = 100 * (Δtotal - Δinactivo) / Δtotal
+cpu_pct() {
+  local t1 i1 t2 i2 lectura
+  lectura="$(leer_cpu)" || { echo "cpu_pct: no se pudo leer /proc/stat" >&2; return 1; }
+  read -r t1 i1 <<< "$lectura"
+  sleep 1
+  lectura="$(leer_cpu)" || { echo "cpu_pct: no se pudo leer /proc/stat" >&2; return 1; }
+  read -r t2 i2 <<< "$lectura"
+
+  awk -v dt="$(( t2 - t1 ))" -v di="$(( i2 - i1 ))" \
+    'BEGIN { if (dt > 0) printf "%.1f\n", 100 * (dt - di) / dt; else print "0.0" }'
+}
+
+# Memoria (/proc/meminfo está en kB). Imprime: "total_mb usada_mb pct"
+# Ejemplo de salida: 3936 1210 30.7   (usada = MemTotal - MemAvailable)
+mem_info() {
+  local salida
+  salida="$(awk '
+    /^MemTotal:/     { t = $2 }
+    /^MemAvailable:/ { a = $2 }
+    END {
+      if (t > 0 && a != "") printf "%d %d %.1f", t / 1024, (t - a) / 1024, 100 * (t - a) / t
+    }' /proc/meminfo)"
+  if [[ -z "$salida" ]]; then
+    echo "mem_info: no se pudo leer MemTotal/MemAvailable" >&2
+    return 1
+  fi
+  echo "$salida"
+}
+
+# Carga media del sistema (1, 5 y 15 min). Imprime: "c1 c5 c15". Ejemplo: 0.15 0.10 0.05
+carga_info() {
+  local c1 c5 c15
+  read -r c1 c5 c15 _ < /proc/loadavg || { echo "carga_info: no se pudo leer /proc/loadavg" >&2; return 1; }
+  [[ -n "$c15" ]] || { echo "carga_info: formato inesperado en /proc/loadavg" >&2; return 1; }
+  echo "$c1 $c5 $c15"
+}
+
+# Tiempo encendido en segundos (entero). Ejemplo: 86400
+uptime_seg() {
+  local up
+  read -r up _ < /proc/uptime || { echo "uptime_seg: no se pudo leer /proc/uptime" >&2; return 1; }
+  [[ -n "$up" ]] || { echo "uptime_seg: formato inesperado en /proc/uptime" >&2; return 1; }
+  echo "${up%.*}"
+}
+
+# Junta las cuatro lecturas en un único objeto JSON.
+recoger_recursos() {
+  local cpu mem mem_total mem_usada mem_pct carga c1 c5 c15 up
+  cpu="$(cpu_pct)"       || return 1
+  mem="$(mem_info)"      || return 1
+  carga="$(carga_info)"  || return 1
+  up="$(uptime_seg)"     || return 1
+  read -r mem_total mem_usada mem_pct <<< "$mem"
+  read -r c1 c5 c15 <<< "$carga"
+
+  jq -n \
+    --argjson cpu "$cpu" \
+    --argjson mem_total "$mem_total" \
+    --argjson mem_usada "$mem_usada" \
+    --argjson mem_pct "$mem_pct" \
+    --argjson c1 "$c1" --argjson c5 "$c5" --argjson c15 "$c15" \
+    --argjson up "$up" \
+    '{cpu_pct: $cpu,
+      mem: {total_mb: $mem_total, usada_mb: $mem_usada, pct: $mem_pct},
+      carga: {"1m": $c1, "5m": $c5, "15m": $c15},
+      uptime_seg: $up}'
 }
 
 # PUESTO 3: datos del sistema. Versión provisional (disco y carga).
@@ -88,18 +158,18 @@ json_o_reserva() {
 }
 
 montar_json() {
-  local host ts procesos sistema
+  local host ts recursos sistema
   host="$(hostname)"
   ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  procesos="$(json_o_reserva procesos "$(recoger_procesos 2>>"$LOG")" '[]')"
+  recursos="$(json_o_reserva recursos "$(recoger_recursos 2>>"$LOG")" '{}')"
   sistema="$(json_o_reserva sistema "$(recoger_sistema 2>>"$LOG")" '{}')"
 
   jq -n \
     --arg host "$host" \
     --arg ts "$ts" \
-    --argjson procesos "$procesos" \
+    --argjson recursos "$recursos" \
     --argjson sistema "$sistema" \
-    '{host: $host, ts: $ts, procesos: $procesos, sistema: $sistema}'
+    '{host: $host, ts: $ts, recursos: $recursos, sistema: $sistema}'
 }
 
 enviar() {
