@@ -1,62 +1,90 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -u
 
-URL_CANAL="http://62.238.114.81:8089/sync"
+URL="http://62.238.114.81:8089/sync"
 INTERVALO=5
 UMBRAL_CAIDO=30
 
-# Ocultar cursor y restaurarlo al salir
-tput civis
-trap 'tput cnorm; clear; exit 0' INT TERM
-
+cleanup() {
+    tput cnorm 2>/dev/null || true
+    echo ""
+}
+trap cleanup EXIT INT TERM
+tput civis 2>/dev/null || true
 clear
 
-while true; do
-    json_raw=$(curl -s "$URL_CANAL")
-    ahora=$(date +%s)
+a_epoch() {
+    local ts="$1"
+    if [[ -z "$ts" || "$ts" == "null" ]]; then
+        echo 0
+        return
+    fi
+    date -d "$ts" +%s 2>/dev/null || date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$ts" +%s 2>/dev/null || echo 0
+}
 
-    # 1. Extraer último informe por host incluyendo ._origen
-    mapfile -t filas < <(echo "$json_raw" | jq -r '
-        [ .messages[] | select(.host != null) ]
-        | sort_by(.ts)
-        | group_by(._origen)
-        | map(last)
-        | .[]
-        | [
-            (._origen // "N/A"),
-	    .host,
-            (if .procesos then (([.procesos[].cpu] | add * 10 | round / 10 | tostring) + "%") else "N/A" end),
-            (if .procesos then (([.procesos[].mem] | add * 10 | round / 10 | tostring) + "%") else "N/A" end),
-            (if .sistema.disco_pct then ((.sistema.disco_pct | tostring) + "%") else "N/A" end),
-            (if .sistema.carga_1m then (.sistema.carga_1m | tostring) else "N/A" end),
-            (.ts | fromdateiso8601)
-          ] | @tsv
-    ')
+while true; do
+    ahora=$(date +%s)
+    json_raw=$(curl -fsS --max-time 6 "$URL" 2>/dev/null)
 
     tput cup 0 0
+    printf "Último mensaje recibido por _origen (%s) | %s\n\n" "$URL" "$(date -d "@$ahora" '+%H:%M:%S' 2>/dev/null || date -r "$ahora" '+%H:%M:%S')"
 
-    # 2. Cabecera con la nueva columna IP ORIGEN (ancho %-16s)
-    printf "%-16s %-15s %-10s %-10s %-10s %-10s %-12s %-10s\n" \
-         "IP ORIGEN" "HOST" "CPU" "MEMORIA" "DISCO /" "CARGA" "ÚLTIMO INF." " ESTADO"
-    printf "%-16s %-15s %-10s %-10s %-10s %-10s %-12s %-10s\n" \
-        "----------------" "---------------" "----------" "----------" "----------" "----------" "------------" "----------"
+    # Busca cualquier objeto en el JSON que tenga ._origen, agrupa por _origen,
+    # toma el último mensaje recibido y ordena por _id
+    ultimos_recibidos=$(printf '%s\n' "$json_raw" | jq -c '
+        [.. | objects | select(has("_origen") and ._origen != null)]
+        | group_by(._origen)
+        | map(max_by([(._recibido // ""), (._id // 0)]))
+        | sort_by(._id // 0)[]
+    ' 2>/dev/null)
 
-    # 3. Filas leyendo también ip_origen
-    for fila in "${filas[@]}"; do
-        IFS=$'\t' read -r ip_origen host cpu mem disco carga ts <<< "$fila"
+    if [[ -z "$ultimos_recibidos" ]]; then
+        printf "No hay mensajes válidos o no responde el endpoint.\n"
+        tput ed
+        sleep "$INTERVALO"
+        continue
+    fi
 
-        diferencia=$((ahora - ts))
-        hora_formateada=$(date -d "@$ts" +"%H:%M:%S" 2>/dev/null || echo "Error")
+    printf "%-16s %-10s %-8s %-20s %-9s %-17s %-10s %-8s\n" \
+        "IP_ORIGEN" "HOST" "CPU" "MEMORIA" "DISCO_/" "CARGA_1/5/15" "HORA_INF" "ESTADO"
+    printf -- "----------------------------------------------------------------------------------------------------\n"
 
-        if (( diferencia > UMBRAL_CAIDO )); then
-            estado="\e[31mCAÍDO\e[0m"
+    while IFS= read -r msg; do
+        read -r ip host cpu mem disco carga ts < <(
+            printf '%s\n' "$msg" | jq -r '[
+                (._origen | tostring),
+                (.host // "-" | tostring),
+                (if .cpu_pct != null then (.cpu_pct | tostring) + "%" else "-" end),
+                (if .mem != null then
+                    ((.mem.usada_mb // "?") | tostring) + "/" +
+                    ((.mem.total_mb // "?") | tostring) + "MB (" +
+                    ((.mem.pct // "?") | tostring) + "%)"
+                 else "-" end),
+                (([.disco[]? | select(.montaje == "/") | .pct][0] // "-") | tostring | if . != "-" then . + "%" else . end),
+                (if (.carga | type) == "array" then (.carga | map(tostring) | join("/")) else "-" end),
+                (.ts // "" | tostring)
+            ] | @tsv'
+        )
+
+        ts_epoch=$(a_epoch "$ts")
+        if [[ "$ts_epoch" -gt 0 ]]; then
+            edad=$((ahora - ts_epoch))
+            (( edad < 0 )) && edad=0
+            hora_inf=$(date -d "@$ts_epoch" '+%H:%M:%S' 2>/dev/null || date -r "$ts_epoch" '+%H:%M:%S')
         else
-            estado="\e[32mOK\e[0m"
+            edad=999999
+            hora_inf="-"
         fi
 
-        printf "%-16s %-15s %-10s %-10s %-10s %-10s %-12s " \
-            "$ip_origen" "$host" "$cpu" "$mem" "$disco" "$carga" "$hora_formateada"
-        echo -e "${estado}$(tput el)"
-    done
+        if (( edad > UMBRAL_CAIDO )); then
+            estado="CAÍDO"
+        else
+            estado="OK"
+        fi
+
+        printf "%-16s %-10s %-8s %-20s %-9s %-17s %-10s %-8s\n" \
+            "$ip" "$host" "$cpu" "$mem" "$disco" "$carga" "$hora_inf" "$estado"
+    done <<< "$ultimos_recibidos"
 
     tput ed
     sleep "$INTERVALO"
